@@ -1,12 +1,12 @@
 #!/bin/sh
 
-qb_version="4.2.5" # 改：改为你的实际qb的版本号
-qb_username="yiyang" # 改：该为你的qb登录用户名
-qb_password="Xx123123" # 改：改为你qb登录的密码
-qb_web_url="http://51.158.150.82:8080" # 查：改为qb的登录地址，一般可以不改
+qb_version="4.2.1" # 改：改为你的实际qb的版本号
+qb_username="user" # 改：该为你的qb登录用户名
+qb_password="passwd" # 改：改为你qb登录的密码
+qb_web_url="http://100.100.100.100:8080" # 查：改为qb的登录地址
 log_dir="/home/qbauto" # 改：改为你日志运行的路径
-rclone_dest="tjsp:" # 运行rclone config查看name字段即可；格式就是"XX:"
-from_dc_tag="/File" # 改：上传后的相对根目录，可为空
+rclone_dest="one:" # 运行rclone config查看name字段即可；格式就是"XX:"
+from_dc_tag="/home" # 改：上传后的相对根目录，可为空
 rclone_parallel="32" # rclone上传线程 默认4
 
 # 下面的也可以自定义，但是推荐不改动
