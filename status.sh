@@ -240,6 +240,7 @@ function install_client() {
     echo -e "${Info} 下载 ${arch} 二进制文件"
     [ -f "/tmp/stat_client" ] || get_status
     mkdir -p ${client_dir}
+    mkdir -p /usr/local/ServerStatus/client
     mv /tmp/stat_client /usr/local/ServerStatus/client/stat_client
     chmod +x /usr/local/ServerStatus/client/stat_client
     input_upm
