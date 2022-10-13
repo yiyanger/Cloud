@@ -231,7 +231,7 @@ function get_status() {
     install_tool
     rm -f ServerStatus-${arch}-unknown-linux-musl.zip stat_*
     cd /tmp || exit
-    wget "${MIRROR}https://github.com/zdz/Serverstatus-Rust/releases/latest/download/client-${arch}-unknown-linux-musl.zip"
+    wget "${MIRROR}https://gh-proxy.com/https://github.com/zdz/Serverstatus-Rust/releases/latest/download/client-${arch}-unknown-linux-musl.zip"
     unzip -o client-${arch}-unknown-linux-musl.zip
 }
 
