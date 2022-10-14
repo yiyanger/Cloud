@@ -3,6 +3,7 @@
 #  Description: Serverstat-Rust
 #  Version: v1.0.0
 #=================================================
+set -ex
 
 Info="\033[32m[信息]\033[0m"
 Error="\033[31m[错误]\033[0m"
