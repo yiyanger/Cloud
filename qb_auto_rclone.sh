@@ -1,13 +1,13 @@
 #!/bin/sh
 
-qb_version="4.2.1" # 改：改为你的实际qb的版本号
+qb_version="4.2.5" # 改：改为你的实际qb的版本号
 qb_username="user" # 改：该为你的qb登录用户名
 qb_password="passwd" # 改：改为你qb登录的密码
 qb_web_url="http://100.100.100.100:8080" # 查：改为qb的登录地址
 log_dir="/home/qbauto" # 改：改为你日志运行的路径
-rclone_dest="one:" # 运行rclone config查看name字段即可；格式就是"XX:"
-from_dc_tag="/home" # 改：上传后的相对根目录，可为空
-rclone_parallel="32" # rclone上传线程 默认4
+rclone_dest="share:" # 运行rclone config查看name字段即可；格式就是"XX:"
+from_dc_tag="/BY/YD" # 改：上传后的相对根目录，可为空
+rclone_parallel="4" # rclone上传线程 默认4
 
 # 下面的也可以自定义，但是推荐不改动
 unfinished_tag="【待上传云端】" # 这个是手动设置某些tag，因为有用才上传
