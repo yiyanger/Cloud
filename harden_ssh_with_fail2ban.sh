@@ -14,7 +14,7 @@
 # - Fedora
 #
 # Author: System Engineering Expert Team
-# Version: 1.0
+# Version: 1.1 (Corrected Syntax Error)
 # ==============================================================================
 
 # --- Script Execution Safeguards ---
@@ -44,47 +44,7 @@ log_success() {
 }
 
 log_error() {
-    echo -e "\033[0;31m[错误] $1\033; then
-    apt-get update -y
-    apt-get install -y fail2ban
-elif; then
-    dnf install -y epel-release
-    dnf install -y fail2ban
-elif; then
-    # Idempotent check for EPEL repository
-    if! rpm -q epel-release &> /dev/null; then
-        log_info "EPEL仓库未安装，正在安装..."
-        yum install -y epel-release
-    else
-        log_info "EPEL仓库已安装。"
-    fi
-    yum install -y fail2ban
-fi
-
-log_success "Fail2ban安装完成。"
-
-# --- Service Management ---
-log_info "启用并启动Fail2ban服务..."
-# 'enable --now' both enables the service for boot and starts it immediately.
-systemctl enable --now fail2ban
-
-# Verify service status
-if! systemctl is-active --quiet fail2ban; then
-    log_error "Fail2ban服务启动失败。请检查 'systemctl status fail2ban' 和 'journalctl -u fail2ban' 获取详细信息。"
-fi
-
-log_success "Fail2ban服务已成功启动并设置为开机自启。"
-
-# --- Configuration for Permanent SSH Ban ---
-# This is the modern, recommended approach using a separate file in jail.d
-JAIL_CONFIG_FILE="/etc/fail2ban/jail.d/sshd-permanent-ban.local"
-
-log_info "正在配置SSH永久封禁规则于: $JAIL_CONFIG_FILE"
-
-# Create the configuration file with the required settings.
-# The EOF markers must not be indented.
-cat > "$JAIL_CONFIG_FILE" << EOF
-[sshd]
+    echo -e "\033[0;31m[错误] $1\033
 # 启用此jail
 enabled = true
 
