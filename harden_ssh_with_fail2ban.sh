@@ -14,7 +14,7 @@
 # - Fedora
 #
 # Author: System Engineering Expert Team
-# Version: 1.1 (Corrected Syntax Error)
+# Version: 1.2 (Corrected Subshell Syntax Error)
 # ==============================================================================
 
 # --- Script Execution Safeguards ---
