@@ -1,98 +1,87 @@
 #!/bin/bash
 
-# ==============================================================================
-# Fail2ban SSH Permanent Ban Automation Script
-#
-# Description:
-# This script automates the installation and configuration of Fail2ban on
-# major Linux distributions to permanently ban IP addresses that fail SSH
-# login attempts multiple times within a 5-minute window.
-#
-# Supported Distributions:
-# - Debian / Ubuntu (and derivatives)
-# - RHEL / CentOS / AlmaLinux / Rocky Linux
-# - Fedora
-#
-# Author: System Engineering Expert Team
-# Version: 1.3 (Final Syntax Correction)
-# ==============================================================================
+# 一键配置fail2ban永久封禁SSH失败IP脚本
+# 使用方法：sudo bash ssh-permanent-ban.sh
 
-# --- Script Execution Safeguards ---
-# Exit immediately if a command exits with a non-zero status.
 set -e
-# Treat unset variables as an error when substituting.
-set -u
-# Pipelines return the exit status of the last command to exit with a
-# non-zero status, or zero if all commands exit successfully.
-set -o pipefail
 
-# --- Prerequisite Validation ---
-# Ensure the script is run with root privileges.
-if [ "$(id -u)" -ne 0 ]; then
-    echo "错误：此脚本必须以root权限运行。请使用 'sudo' 执行。" >&2
+echo "=== Fail2Ban SSH永久封禁配置脚本 ==="
+
+# 检查是否为root用户
+if [ "$EUID" -ne 0 ]; then
+    echo "请使用sudo或以root用户运行此脚本"
     exit 1
 fi
 
-# --- Function Definitions ---
-# A standardized function for logging messages.
-log_info() {
-    echo "[信息] $1"
-}
+# 检测系统类型并安装fail2ban
+echo "正在安装fail2ban..."
+if command -v apt-get &> /dev/null; then
+    apt-get update
+    apt-get install -y fail2ban
+elif command -v yum &> /dev/null; then
+    yum install -y fail2ban
+elif command -v dnf &> /dev/null; then
+    dnf install -y fail2ban
+else
+    echo "不支持的包管理器，请手动安装fail2ban"
+    exit 1
+fi
 
-log_success() {
-    echo -e "\033[0;32m[成功] $1\033[0m"
-}
-
-log_error() {
-    echo -e "\033[0;31m[错误] $1\033
-# 启用此jail
+# 创建自定义配置文件
+echo "正在配置fail2ban规则..."
+cat > /etc/fail2ban/jail.d/ssh-permanent-ban.conf << 'EOF'
+[sshd]
+# 启用此规则
 enabled = true
 
-# 监控的端口 (使用服务名更具可移植性)
-port = ssh
+# 监控的端口
+port    = ssh
 
-# 使用内置的sshd过滤器
-filter = sshd
-
-# 使用Fail2ban的变量自动检测日志路径，兼容Debian/RHEL系
+# 日志路径
 logpath = %(sshd_log)s
 
-# 自动检测日志后端 (如systemd-journal或文件)
-backend = auto
-
-# 在5分钟 (300秒) 内
-findtime = 300
-
-# 达到3次失败尝试
+# 5分钟内最多允许的失败次数
 maxretry = 3
 
-# 则永久封禁 (bantime = -1)
+# 检测时间窗口（5分钟=300秒）
+findtime = 300
+
+# 封禁时间：-1表示永久封禁
 bantime = -1
+
+# 封禁动作（封禁所有端口）
+action = iptables-allports[name=sshd, protocol=all]
+
+# 可选：忽略本地IP
+# ignoreip = 127.0.0.1/8 ::1
 EOF
 
-log_success "SSH永久封禁规则配置完成。"
+# 重启fail2ban服务
+echo "正在启动fail2ban服务..."
+systemctl enable fail2ban
+systemctl restart fail2ban
 
-# --- Finalizing and Restarting Service ---
-log_info "正在重新加载Fail2ban配置以应用新规则..."
-fail2ban-client reload
+# 等待服务启动
+sleep 3
 
-# A small delay to allow the service to process the new configuration.
-sleep 2
+# 检查服务状态
+if systemctl is-active --quiet fail2ban; then
+    echo "✓ Fail2Ban服务运行正常"
+else
+    echo "✗ Fail2Ban服务启动失败，请检查日志"
+    exit 1
+fi
 
-# --- Verification and Post-Execution Instructions ---
-log_success "Fail2ban自动化部署已成功完成！"
-echo "-----------------------------------------------------------------"
-echo "重要操作指令:"
+# 显示配置信息
 echo ""
-echo "1. 验证sshd jail状态:"
-echo "   sudo fail2ban-client status sshd"
+echo "=== 配置完成 ==="
+echo "✓ Fail2Ban已成功配置"
+echo "✓ 规则：5分钟内SSH登录失败3次，IP将被永久封禁"
+echo "✓ 封禁范围：所有端口"
 echo ""
-echo "2. 如果意外封禁了合法IP，请使用以下命令解封 (将<IP_ADDRESS>替换为实际IP):"
-echo "   sudo fail2ban-client set sshd unbanip <IP_ADDRESS>"
+echo "常用命令："
+echo "查看被封禁IP: fail2ban-client status sshd"
+echo "解封特定IP: fail2ban-client set sshd unbanip IP地址"
+echo "查看fail2ban日志: tail -f /var/log/fail2ban.log"
 echo ""
-echo "3. 建议将您的可信IP地址加入白名单，编辑文件 '$JAIL_CONFIG_FILE' 并添加一行:"
-echo "   ignoreip = 127.0.0.1/8 ::1 YOUR_STATIC_IP_HERE"
-echo "   添加后，执行 'sudo fail2ban-client reload' 重载配置。"
-echo "-----------------------------------------------------------------"
-
-exit 0
+echo "注意：请确保您不会意外锁定自己！"
