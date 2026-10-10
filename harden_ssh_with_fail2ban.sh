@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-# harden_ssh_with_fail2ban.sh  (v2.3 - 自适应加固版)
+# harden_ssh_with_fail2ban.sh  (v2.4 - 自适应加固版)
 # 功能：安装并配置 fail2ban；SSH 登录失败 3 次（5 分钟窗口）即永久封禁该 IP
 #       （封禁该 IP 的所有端口）
+# ---------------------------------------------------------------------------
 # 用法：  sudo bash harden_ssh_with_fail2ban.sh
 # 放行你的管理 IP（可选）：
 #         sudo EXTRA_IGNOREIP="1.2.3.4" bash harden_ssh_with_fail2ban.sh
@@ -24,7 +25,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-echo "=== Fail2Ban SSH 永久封禁配置脚本 (v2.3 自适应版) ==="
+echo "=== Fail2Ban SSH 永久封禁配置脚本 (v2.4 自适应版) ==="
 if [ -r /etc/os-release ]; then
     . /etc/os-release
     echo "系统：${PRETTY_NAME:-unknown}    内核：$(uname -r)"
@@ -177,7 +178,7 @@ fi
 
 write_conf() {
 cat > "$CONF" <<EOF
-# 由 harden_ssh_with_fail2ban.sh (v2.3) 自动生成  $(date '+%F %T')
+# 由 harden_ssh_with_fail2ban.sh (v2.4) 自动生成  $(date '+%F %T')
 # 目标：5 分钟内 SSH 失败 3 次 -> 该 IP 永久封禁（所有端口）
 
 [DEFAULT]
@@ -199,7 +200,8 @@ findtime = 300
 # 封禁时长：-1 表示永久
 bantime  = -1
 # 使用 allports 动作：封禁该 IP 的所有端口
-action   = %(action_allports)s
+# 注意：不能写 %(action_allports)s（jail.conf 里没有这个键），照抄 action_ 的结构
+action   = %(banaction_allports)s[port="%(port)s", protocol="%(protocol)s", chain="%(chain)s"]
 # 不封禁本机（可追加你的管理 IP）
 ${IGNOREIP_LINE}
 EOF
@@ -207,16 +209,50 @@ EOF
 write_conf
 echo "-> 已写入 $CONF"
 
-# 配置自检：不通过（例如该 fail2ban 版本不支持所选动作）就自动回退到 iptables-allports
-if ! fail2ban-server -t >/dev/null 2>&1; then
-    ylw "配置自检未通过，尝试回退到 iptables-allports ..."
-    command -v iptables >/dev/null 2>&1 || pkg_install iptables >/dev/null 2>&1 || true
-    if command -v iptables >/dev/null 2>&1; then
-        FIREWALL=iptables
-        BANACTION_ALLPORTS='iptables-allports'
-        write_conf
-        echo "-> 已改用 $BANACTION_ALLPORTS 重新写入 $CONF"
+# ---------- 5b. 配置自检（必须先过，再谈启动）----------
+# v2.3 的教训：自检失败时【不要】盲目换后端。上次真正的报错是模板引用了不存在的
+# %(action_allports)s，跟 nftables / iptables 毫无关系，换后端照样失败还带偏方向。
+FAIL_CFG=0
+TLOG=$(mktemp)
+
+if fail2ban-server -t >"$TLOG" 2>&1; then
+    echo "-> 配置自检通过（fail2ban-server -t）"
+else
+    ylw "✗ 配置自检未通过（当前 banaction_allports = $BANACTION_ALLPORTS），真实报错："
+    tail -n 6 "$TLOG" | sed 's/^/    /'
+    if grep -qi 'Bad value substitution' "$TLOG"; then
+        red "  ↑ 配置模板引用了不存在的变量：换防火墙后端解决不了，必须改模板。"
+        FAIL_CFG=1
+    elif [ "$BANACTION_ALLPORTS" = 'iptables-allports' ]; then
+        red "  ↑ 已经是 iptables-allports 仍不通过，看上面这 6 行。"
+        FAIL_CFG=1
+    else
+        ylw "-> 疑似动作不受支持，回退到 iptables-allports 重试 ..."
+        command -v iptables >/dev/null 2>&1 || pkg_install iptables >/dev/null 2>&1 || true
+        if command -v iptables >/dev/null 2>&1; then
+            FIREWALL=iptables
+            BANACTION_ALLPORTS='iptables-allports'
+            write_conf
+            if fail2ban-server -t >"$TLOG" 2>&1; then
+                echo "-> 已改用 iptables-allports 重写 $CONF，自检通过"
+            else
+                red "✗ 回退后仍不通过，报错："
+                tail -n 6 "$TLOG" | sed 's/^/    /'
+                FAIL_CFG=1
+            fi
+        else
+            red "✗ 装不上 iptables，无法回退"
+            FAIL_CFG=1
+        fi
     fi
+fi
+rm -f "$TLOG"
+
+if [ "$FAIL_CFG" = 1 ]; then
+    echo
+    red "配置本身不合法，停在这里，不再去启动服务（免得又只看到一个含糊的『启动失败』）。"
+    red "请把上面这段报错发出来。"
+    exit 1
 fi
 
 # ---------- 6. 启动服务 ----------
