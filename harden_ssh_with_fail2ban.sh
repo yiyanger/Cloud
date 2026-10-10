@@ -1,87 +1,330 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ============================================================================
+# harden_ssh_with_fail2ban.sh  (v2.3 - 自适应加固版)
+# 功能：安装并配置 fail2ban；SSH 登录失败 3 次（5 分钟窗口）即永久封禁该 IP
+#       （封禁该 IP 的所有端口）
+# 用法：  sudo bash harden_ssh_with_fail2ban.sh
+# 放行你的管理 IP（可选）：
+#         sudo EXTRA_IGNOREIP="1.2.3.4" bash harden_ssh_with_fail2ban.sh
+# ============================================================================
 
-# 一键配置fail2ban永久封禁SSH失败IP脚本
-# 使用方法：sudo bash ssh-permanent-ban.sh
+set -uo pipefail
 
-set -e
+CONF=/etc/fail2ban/jail.d/zz-sshd-permanent-ban.local
+LEGACY_CONF=/etc/fail2ban/jail.d/ssh-permanent-ban.conf
+SOCK=/run/fail2ban/fail2ban.sock
 
-echo "=== Fail2Ban SSH永久封禁配置脚本 ==="
+red() { printf '\033[31m%s\033[0m\n' "$*"; }
+grn() { printf '\033[32m%s\033[0m\n' "$*"; }
+ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
 
-# 检查是否为root用户
-if [ "$EUID" -ne 0 ]; then
-    echo "请使用sudo或以root用户运行此脚本"
+# ---------- 0. root 检查 ----------
+if [ "$(id -u)" -ne 0 ]; then
+    red "请使用 sudo 或 root 运行：sudo bash $0"
     exit 1
 fi
 
-# 检测系统类型并安装fail2ban
-echo "正在安装fail2ban..."
-if command -v apt-get &> /dev/null; then
-    apt-get update
-    apt-get install -y fail2ban
-elif command -v yum &> /dev/null; then
-    yum install -y fail2ban
-elif command -v dnf &> /dev/null; then
-    dnf install -y fail2ban
+echo "=== Fail2Ban SSH 永久封禁配置脚本 (v2.3 自适应版) ==="
+if [ -r /etc/os-release ]; then
+    . /etc/os-release
+    echo "系统：${PRETTY_NAME:-unknown}    内核：$(uname -r)"
+fi
+
+# ---------- 1. 识别包管理器 ----------
+if command -v apt-get >/dev/null 2>&1; then
+    PKG=apt
+elif command -v dnf >/dev/null 2>&1; then
+    PKG=dnf
+elif command -v yum >/dev/null 2>&1; then
+    PKG=yum
 else
-    echo "不支持的包管理器，请手动安装fail2ban"
+    red "不支持的包管理器，请手动安装 fail2ban 后重试"
     exit 1
 fi
 
-# 创建自定义配置文件
-echo "正在配置fail2ban规则..."
-cat > /etc/fail2ban/jail.d/ssh-permanent-ban.conf << 'EOF'
+pkg_install() {
+    case "$PKG" in
+        apt)
+            DEBIAN_FRONTEND=noninteractive apt-get -qq update 2>/dev/null \
+                || ylw "  (apt update 有警告，忽略继续)"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+            ;;
+        dnf) dnf install -y "$@" ;;
+        yum) yum install -y "$@" ;;
+    esac
+}
+
+# ---------- 2. 安装 fail2ban ----------
+echo "-> 安装 fail2ban ..."
+pkg_install fail2ban >/dev/null 2>&1 || { red "fail2ban 安装失败，请检查软件源"; exit 1; }
+command -v fail2ban-server >/dev/null 2>&1 || { red "未找到 fail2ban-server，安装异常"; exit 1; }
+echo "   fail2ban 版本：$(fail2ban-server --version 2>/dev/null | tail -1)"
+
+# ---------- 3. 选择日志后端 ----------
+USE_SD=0
+BACKEND_LINE=""
+LOGPATH_LINE=""
+JOURNALMATCH_LINE=""
+JM_VALUE=""
+AUTH_LOG=""
+
+if command -v journalctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    USE_SD=1
+    # systemd 后端需要 python3-systemd（Debian 12 里只是 Recommends，精简系统常缺；
+    # Debian 13 已改为硬依赖）
+    if ! python3 -c 'import systemd' >/dev/null 2>&1; then
+        echo "-> 安装 python3-systemd（systemd 日志后端依赖）..."
+        pkg_install python3-systemd >/dev/null 2>&1 || true
+    fi
+    if python3 -c 'import systemd' >/dev/null 2>&1; then
+        BACKEND_LINE="backend  = systemd"
+        LOGPATH_LINE="# 用 systemd 后端时不写 logpath（写了也不会读，且旧版会据此报错）"
+        echo "-> 日志后端：systemd journal"
+    else
+        ylw "python3-systemd 不可用，回退到文件后端"
+        USE_SD=0
+    fi
+fi
+
+if [ "$USE_SD" = 0 ]; then
+    for f in /var/log/auth.log /var/log/secure; do
+        [ -f "$f" ] && { AUTH_LOG="$f"; break; }
+    done
+    if [ -z "$AUTH_LOG" ]; then
+        ylw "未找到认证日志文件，尝试安装并启动 rsyslog ..."
+        pkg_install rsyslog >/dev/null 2>&1 || true
+        systemctl enable --now rsyslog >/dev/null 2>&1 || true
+        sleep 1
+        for f in /var/log/auth.log /var/log/secure; do
+            [ -f "$f" ] && { AUTH_LOG="$f"; break; }
+        done
+    fi
+    if [ -n "$AUTH_LOG" ]; then
+        BACKEND_LINE="backend  = auto"
+        LOGPATH_LINE="logpath  = %(sshd_log)s"
+        echo "-> 日志后端：文件（$AUTH_LOG）"
+    else
+        red "既无 systemd journal 也无认证日志文件，无法确定日志来源"
+        exit 1
+    fi
+fi
+
+# ---------- 3b. 生成 journalmatch ----------
+# 关键：Debian 12 的 fail2ban 包自带配置里【没有】journalmatch，必须显式写。
+# 否则用 systemd 后端时 fail2ban 默认去找 _SYSTEMD_UNIT=sshd.service，
+# 而 Debian 上 sshd 的 systemd unit 实际叫 ssh.service → jail 起来了却抓不到日志。
+# journalmatch 沿用 journalctl 的匹配语法：空格 = AND，'+' = OR。
+if [ "$USE_SD" = 1 ]; then
+    JM_VALUE="_SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service + _COMM=sshd + _COMM=sshd-session"
+    JOURNALMATCH_LINE="journalmatch = ${JM_VALUE}"
+    echo "-> journalmatch：已显式指定（覆盖 ssh.service / sshd.service / sshd-session）"
+fi
+
+# ---------- 4. 选择防火墙后端 ----------
+FIREWALL=""
+BANACTION_ALLPORTS=""
+
+UFW_ACTIVE=0
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    UFW_ACTIVE=1
+fi
+
+if [ "$UFW_ACTIVE" = 1 ]; then
+    # ufw 活跃时沿用 iptables 链路，避免与 nft 规则表相互打架
+    command -v iptables >/dev/null 2>&1 || pkg_install iptables >/dev/null 2>&1 || true
+    FIREWALL=iptables
+    BANACTION_ALLPORTS='iptables-allports'
+elif command -v nft >/dev/null 2>&1; then
+    FIREWALL=nftables
+    BANACTION_ALLPORTS='nftables[type=allports]'
+elif command -v iptables >/dev/null 2>&1; then
+    FIREWALL=iptables
+    BANACTION_ALLPORTS='iptables-allports'
+else
+    echo "-> 未检测到防火墙工具，尝试安装 nftables ..."
+    pkg_install nftables >/dev/null 2>&1 || pkg_install iptables >/dev/null 2>&1 || true
+    if command -v nft >/dev/null 2>&1; then
+        FIREWALL=nftables; BANACTION_ALLPORTS='nftables[type=allports]'
+    elif command -v iptables >/dev/null 2>&1; then
+        FIREWALL=iptables; BANACTION_ALLPORTS='iptables-allports'
+    else
+        red "无法安装任何防火墙后端（nftables / iptables）"
+        exit 1
+    fi
+fi
+echo "-> 防火墙后端：$FIREWALL   (banaction_allports = $BANACTION_ALLPORTS)"
+
+# ---------- 5. 写配置 ----------
+mkdir -p /etc/fail2ban/jail.d
+if [ -f "$CONF" ]; then
+    cp -a "$CONF" "${CONF}.bak.$(date +%s)"
+    ylw "已备份旧配置：${CONF}.bak.*"
+fi
+
+# v1 写的旧文件（jail.d/*.conf 优先级低于本脚本，但留着容易看混，直接清掉）
+if [ -f "$LEGACY_CONF" ]; then
+    rm -f "$LEGACY_CONF"
+    ylw "已移除 v1 的旧配置：$LEGACY_CONF"
+fi
+if [ -f /etc/fail2ban/jail.local ]; then
+    ylw "提示：检测到 /etc/fail2ban/jail.local；本脚本写在 jail.d/*.local，优先级更高，会覆盖它"
+fi
+
+IGNOREIP_LINE="ignoreip = 127.0.0.1/8 ::1"
+if [ -n "${EXTRA_IGNOREIP:-}" ]; then
+    IGNOREIP_LINE="$IGNOREIP_LINE ${EXTRA_IGNOREIP}"
+fi
+
+write_conf() {
+cat > "$CONF" <<EOF
+# 由 harden_ssh_with_fail2ban.sh (v2.3) 自动生成  $(date '+%F %T')
+# 目标：5 分钟内 SSH 失败 3 次 -> 该 IP 永久封禁（所有端口）
+
+[DEFAULT]
+# 封禁动作的底层实现，自动匹配本机防火墙后端
+banaction_allports = ${BANACTION_ALLPORTS}
+
 [sshd]
-# 启用此规则
-enabled = true
+enabled  = true
+port     = ssh
+filter   = sshd
+${BACKEND_LINE}
+${LOGPATH_LINE}
+${JOURNALMATCH_LINE}
 
-# 监控的端口
-port    = ssh
-
-# 日志路径
-logpath = %(sshd_log)s
-
-# 5分钟内最多允许的失败次数
+# 检测窗口内允许的失败次数
 maxretry = 3
-
-# 检测时间窗口（5分钟=300秒）
+# 检测窗口：5 分钟
 findtime = 300
-
-# 封禁时间：-1表示永久封禁
-bantime = -1
-
-# 封禁动作（封禁所有端口）
-action = iptables-allports[name=sshd, protocol=all]
-
-# 可选：忽略本地IP
-# ignoreip = 127.0.0.1/8 ::1
+# 封禁时长：-1 表示永久
+bantime  = -1
+# 使用 allports 动作：封禁该 IP 的所有端口
+action   = %(action_allports)s
+# 不封禁本机（可追加你的管理 IP）
+${IGNOREIP_LINE}
 EOF
+}
+write_conf
+echo "-> 已写入 $CONF"
 
-# 重启fail2ban服务
-echo "正在启动fail2ban服务..."
-systemctl enable fail2ban
-systemctl restart fail2ban
+# 配置自检：不通过（例如该 fail2ban 版本不支持所选动作）就自动回退到 iptables-allports
+if ! fail2ban-server -t >/dev/null 2>&1; then
+    ylw "配置自检未通过，尝试回退到 iptables-allports ..."
+    command -v iptables >/dev/null 2>&1 || pkg_install iptables >/dev/null 2>&1 || true
+    if command -v iptables >/dev/null 2>&1; then
+        FIREWALL=iptables
+        BANACTION_ALLPORTS='iptables-allports'
+        write_conf
+        echo "-> 已改用 $BANACTION_ALLPORTS 重新写入 $CONF"
+    fi
+fi
 
-# 等待服务启动
+# ---------- 6. 启动服务 ----------
+echo "-> 启动 fail2ban ..."
+rm -f "$SOCK" 2>/dev/null || true
+systemctl enable fail2ban >/dev/null 2>&1 || true
+systemctl reset-failed fail2ban >/dev/null 2>&1 || true
+systemctl restart fail2ban >/dev/null 2>&1 || true   # 故意吞掉输出，失败在下面统一诊断
 sleep 3
 
-# 检查服务状态
-if systemctl is-active --quiet fail2ban; then
-    echo "✓ Fail2Ban服务运行正常"
-else
-    echo "✗ Fail2Ban服务启动失败，请检查日志"
-    exit 1
+# ---------- 7. 验证服务 ----------
+FAIL=0
+if ! systemctl is-active --quiet fail2ban; then
+    red "✗ fail2ban 服务未启动，以下是真实原因（v1 里被吞掉的那部分）："
+    echo "-------- systemctl status fail2ban --------"
+    systemctl status fail2ban --no-pager -l 2>&1 | tail -n 40
+    echo "-------- journalctl -u fail2ban（最近 50 行）--------"
+    journalctl -u fail2ban -n 50 --no-pager 2>&1 || true
+    echo "-------- 配置语法自检 --------"
+    fail2ban-server -t 2>&1 | tail -n 30 || true
+    FAIL=1
+elif ! fail2ban-client status sshd >/dev/null 2>&1; then
+    ylw "⚠ 服务在运行，但 sshd jail 未加载："
+    fail2ban-client status 2>&1 || true
+    FAIL=1
 fi
 
-# 显示配置信息
-echo ""
-echo "=== 配置完成 ==="
-echo "✓ Fail2Ban已成功配置"
-echo "✓ 规则：5分钟内SSH登录失败3次，IP将被永久封禁"
-echo "✓ 封禁范围：所有端口"
-echo ""
+# ---------- 8. 校验「日志源」是否真的接通 ----------
+# 服务 active 不等于在干活：日志源没接上时，jail 会安静地一条都不抓。
+if [ "$FAIL" = 0 ]; then
+    grn "✓ fail2ban 运行正常，sshd jail 已加载"
+    fail2ban-client status sshd
+
+    echo "-> 校验日志源..."
+    if [ "$USE_SD" = 1 ]; then
+        echo "   journalmatch = $(fail2ban-client get sshd journalmatch 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')"
+        # 必须用 -m 把 jail 里的 journalmatch 传给 fail2ban-regex。
+        # 不带 -m 时它只会用 filter.d/sshd.conf 自带的
+        #   journalmatch = _SYSTEMD_UNIT=sshd.service + _COMM=sshd
+        # 这条不含 _SYSTEMD_UNIT=ssh.service，而 Debian 13 是 OpenSSH 10.x：
+        # 认证失败日志由 sshd-session 进程产生，_COMM 是 sshd-session，
+        # 于是会打印 "0 matched" —— 假报警，jail 本身是好的。
+        if command -v fail2ban-regex >/dev/null 2>&1; then
+            printf '   fail2ban-regex(journal): '
+            RGX_OUT=$(fail2ban-regex -m "$JM_VALUE" systemd-journal /etc/fail2ban/filter.d/sshd.conf 2>/dev/null \
+                | grep -o 'Lines:.*' | tail -1)
+            if [ -n "$RGX_OUT" ]; then
+                echo "$RGX_OUT"
+                MATCHED=$(echo "$RGX_OUT" | grep -o '[0-9]* matched' | grep -o '^[0-9]*')
+                if [ "${MATCHED:-0}" = 0 ]; then
+                    ylw "   ⚠ 最近日志里 0 匹配：若这台机器近期确实有过 SSH 失败登录，说明日志源没接上"
+                fi
+            else
+                echo "跳过"
+            fi
+        fi
+        echo "   提示：用另一台机器故意输错密码 3 次，再回来执行 fail2ban-client status sshd"
+        echo "         看 Currently failed / Total failed 是否增长，这是最终验收标准。"
+    else
+        echo "   logpath = ${AUTH_LOG}"
+        if command -v fail2ban-regex >/dev/null 2>&1 && [ -n "$AUTH_LOG" ]; then
+            printf '   fail2ban-regex(file): '
+            fail2ban-regex "$AUTH_LOG" /etc/fail2ban/filter.d/sshd.conf 2>/dev/null \
+                | grep -o 'Lines:.*' | tail -1 || echo "跳过"
+        fi
+    fi
+
+    # ---------- 9. 封禁链路自测 ----------
+    TESTIP=198.51.100.7   # RFC5737 保留测试网段，不会是真实主机
+    echo "-> 自测封禁链路（临时封禁 $TESTIP）..."
+    if fail2ban-client set sshd banip "$TESTIP" >/dev/null 2>&1; then
+        RULE_OK=0
+        if [ "$FIREWALL" = nftables ]; then
+            nft list ruleset 2>/dev/null | grep -q "$TESTIP" && RULE_OK=1
+        else
+            iptables -L -n 2>/dev/null | grep -q "$TESTIP" && RULE_OK=1
+        fi
+        fail2ban-client set sshd unbanip "$TESTIP" >/dev/null 2>&1 || true
+        if [ "$RULE_OK" = 1 ]; then
+            grn "✓ 防火墙规则已下发，封禁链路正常"
+        else
+            ylw "⚠ 封禁已记录，但未在 $FIREWALL 中看到规则，请检查防火墙后端是否匹配"
+        fi
+    else
+        ylw "⚠ 封禁自测失败，请查看 /var/log/fail2ban.log"
+    fi
+fi
+
+# ---------- 10. 结果 ----------
+echo
+echo "=== 结果 ==="
+if [ "$FAIL" = 0 ]; then
+    grn "✓ Fail2Ban 已成功配置"
+    echo "  规则：5 分钟内 SSH 登录失败 3 次 → 该 IP 永久封禁（所有端口）"
+else
+    red "✗ 配置未生效，请把上面的诊断输出发出来"
+fi
+echo
 echo "常用命令："
-echo "查看被封禁IP: fail2ban-client status sshd"
-echo "解封特定IP: fail2ban-client set sshd unbanip IP地址"
-echo "查看fail2ban日志: tail -f /var/log/fail2ban.log"
-echo ""
+echo "  查看状态     : fail2ban-client status sshd"
+echo "  查看日志源   : fail2ban-client get sshd journalmatch"
+echo "  解封 IP      : fail2ban-client set sshd unbanip <IP>"
+echo "  查看日志     : tail -f /var/log/fail2ban.log"
+echo "  语法自检     : fail2ban-server -t"
+echo
+ylw "防自锁提醒：如需放行固定管理 IP，编辑 $CONF，"
+ylw "把 ignoreip 改成：ignoreip = 127.0.0.1/8 ::1 你的公网IP"
+echo
 echo "注意：请确保您不会意外锁定自己！"
+
+exit "$FAIL"
