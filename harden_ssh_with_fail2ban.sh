@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================================
-# harden_ssh_with_fail2ban.sh  (v2.4 - 自适应加固版)
+# harden_ssh_with_fail2ban.sh  (v2.5 - 自适应加固版)
 # 功能：安装并配置 fail2ban；SSH 登录失败 3 次（5 分钟窗口）即永久封禁该 IP
 #       （封禁该 IP 的所有端口）
 # ---------------------------------------------------------------------------
 # 用法：  sudo bash harden_ssh_with_fail2ban.sh
 # 放行你的管理 IP（可选）：
 #         sudo EXTRA_IGNOREIP="1.2.3.4" bash harden_ssh_with_fail2ban.sh
+# ---------------------------------------------------------------------------
+# v2.5：最后的「日志源校验」（fail2ban-regex）全程套 timeout（默认 30s）。
+#   原因：fail2ban-regex 走 systemd-journal 时会从 journal 最早一条开始【全量扫描】，
+#   条目多时要跑几分钟，中途没有任何输出 —— 看起来就像脚本卡死或在等你输入。
+#   现在超时/失败会自动退回「最近 1 小时日志快照」再测一次（秒级完成），
+#   并且 stderr 不再被丢掉，出错时能直接看到原因。
 # ============================================================================
 
 set -uo pipefail
@@ -25,7 +31,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-echo "=== Fail2Ban SSH 永久封禁配置脚本 (v2.4 自适应版) ==="
+echo "=== Fail2Ban SSH 永久封禁配置脚本 (v2.5 自适应版) ==="
 if [ -r /etc/os-release ]; then
     . /etc/os-release
     echo "系统：${PRETTY_NAME:-unknown}    内核：$(uname -r)"
@@ -178,7 +184,7 @@ fi
 
 write_conf() {
 cat > "$CONF" <<EOF
-# 由 harden_ssh_with_fail2ban.sh (v2.4) 自动生成  $(date '+%F %T')
+# 由 harden_ssh_with_fail2ban.sh (v2.5) 自动生成  $(date '+%F %T')
 # 目标：5 分钟内 SSH 失败 3 次 -> 该 IP 永久封禁（所有端口）
 
 [DEFAULT]
@@ -282,31 +288,62 @@ fi
 
 # ---------- 8. 校验「日志源」是否真的接通 ----------
 # 服务 active 不等于在干活：日志源没接上时，jail 会安静地一条都不抓。
+# 注意：fail2ban-regex 走 systemd-journal 时会【从 journal 最早一条开始全量扫描】，
+#       条目多时要跑几分钟且中途无输出（看着像卡死/等你输入），所以一律套 timeout。
+REGEX_TIMEOUT=${REGEX_TIMEOUT:-30}
+
+# 统一封装：跑一次 fail2ban-regex，只取 "Lines:" 那一行；成功输出该行并返回 0
+regex_check() {
+    local label="$1"; shift
+    local ro rr rc lines matched ok=1
+    ro=$(mktemp); rr=$(mktemp)
+    timeout "$REGEX_TIMEOUT" fail2ban-regex "$@" >"$ro" 2>"$rr"
+    rc=$?
+    lines=$(grep -o 'Lines:.*' "$ro" 2>/dev/null | tail -1)
+    printf '   %s: ' "$label"
+    if [ -n "$lines" ]; then
+        echo "$lines"
+        ok=0
+        matched=$(printf '%s\n' "$lines" | grep -o '[0-9]* matched' | grep -o '^[0-9]*')
+        if [ "${matched:-0}" = 0 ]; then
+            ylw "      ⚠ 0 匹配：若这台机器近期确实有过 SSH 失败登录，说明日志源没接上"
+        fi
+    elif [ "$rc" = 124 ]; then
+        echo "超过 ${REGEX_TIMEOUT}s 未完成（journal 条目过多），跳过全量扫描"
+    else
+        echo "未能完成（exit=$rc），原始报错："
+        tail -n 5 "$rr" | sed 's/^/      /'
+    fi
+    rm -f "$ro" "$rr"
+    return $ok
+}
+
 if [ "$FAIL" = 0 ]; then
     grn "✓ fail2ban 运行正常，sshd jail 已加载"
     fail2ban-client status sshd
 
     echo "-> 校验日志源..."
+    echo "   （fail2ban-regex 会扫描 journal，最长等 ${REGEX_TIMEOUT}s，期间无输出是正常的）"
     if [ "$USE_SD" = 1 ]; then
         echo "   journalmatch = $(fail2ban-client get sshd journalmatch 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')"
         # 必须用 -m 把 jail 里的 journalmatch 传给 fail2ban-regex。
         # 不带 -m 时它只会用 filter.d/sshd.conf 自带的
         #   journalmatch = _SYSTEMD_UNIT=sshd.service + _COMM=sshd
-        # 这条不含 _SYSTEMD_UNIT=ssh.service，而 Debian 13 是 OpenSSH 10.x：
+        # 这条不含 _SYSTEMD_UNIT=ssh.service。在 Debian 13（OpenSSH 10.x）上更糟：
         # 认证失败日志由 sshd-session 进程产生，_COMM 是 sshd-session，
         # 于是会打印 "0 matched" —— 假报警，jail 本身是好的。
         if command -v fail2ban-regex >/dev/null 2>&1; then
-            printf '   fail2ban-regex(journal): '
-            RGX_OUT=$(fail2ban-regex -m "$JM_VALUE" systemd-journal /etc/fail2ban/filter.d/sshd.conf 2>/dev/null \
-                | grep -o 'Lines:.*' | tail -1)
-            if [ -n "$RGX_OUT" ]; then
-                echo "$RGX_OUT"
-                MATCHED=$(echo "$RGX_OUT" | grep -o '[0-9]* matched' | grep -o '^[0-9]*')
-                if [ "${MATCHED:-0}" = 0 ]; then
-                    ylw "   ⚠ 最近日志里 0 匹配：若这台机器近期确实有过 SSH 失败登录，说明日志源没接上"
+            if ! regex_check "fail2ban-regex(journal)" \
+                    -m "$JM_VALUE" systemd-journal /etc/fail2ban/filter.d/sshd.conf; then
+                # 兜底：导出最近 1 小时日志做快照再测，秒级完成且必定有结果
+                SNAP=$(mktemp)
+                if journalctl --since '-1h' --no-pager -o short >"$SNAP" 2>/dev/null && [ -s "$SNAP" ]; then
+                    regex_check "fail2ban-regex(最近1h快照)" "$SNAP" /etc/fail2ban/filter.d/sshd.conf \
+                        || ylw "      快照内也没有匹配，可能这 1 小时确实没有 SSH 失败登录"
+                else
+                    ylw "      拿不到日志快照，跳过该步（不影响 fail2ban 本身）"
                 fi
-            else
-                echo "跳过"
+                rm -f "$SNAP"
             fi
         fi
         echo "   提示：用另一台机器故意输错密码 3 次，再回来执行 fail2ban-client status sshd"
@@ -314,9 +351,7 @@ if [ "$FAIL" = 0 ]; then
     else
         echo "   logpath = ${AUTH_LOG}"
         if command -v fail2ban-regex >/dev/null 2>&1 && [ -n "$AUTH_LOG" ]; then
-            printf '   fail2ban-regex(file): '
-            fail2ban-regex "$AUTH_LOG" /etc/fail2ban/filter.d/sshd.conf 2>/dev/null \
-                | grep -o 'Lines:.*' | tail -1 || echo "跳过"
+            regex_check "fail2ban-regex(file)" "$AUTH_LOG" /etc/fail2ban/filter.d/sshd.conf
         fi
     fi
 
